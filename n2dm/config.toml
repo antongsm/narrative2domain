@@ -1,0 +1,5 @@
+[openai]
+api_key = ""
+model   = "gpt-4o"
+timeout = 60
+max_tokens = 48000
