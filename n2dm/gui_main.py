@@ -1,33 +1,26 @@
 #!/usr/bin/env python3
 """
-n2dm.gui_main — графический интерфейс Narrative2DomainModel
------------------------------------------------------------
+n2dm.gui_main ― основное Qt-окно Narrative2DomainModel
 
-Содержит:
-• SettingsDialog — ввод / изменение OpenAI API‑ключа
-• PipelineRunner  — асинхронный исполнитель конвейера (работает в QThread)
-• MainWindow      — главное окно приложения
+* Загрузка текстового / аудио-файла
+* Запуск асинхронного конвейера
+* Вкладки: предпросмотр, прогресс, JSON-схема, BPMN-XML, отчёт
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
-    QDialog,
     QFileDialog,
-    QFormLayout,
-    QLabel,
-    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -35,237 +28,187 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QTextEdit,
     QToolBar,
-    QWidget,
 )
 
-from n2dm.config import load_config, save_config
-from n2dm.pipeline import ALL_STEPS  # список настроенных шагов
-from n2dm.log import init_logging
+from n2dm.pipeline.action import ActionExtractor
+from n2dm.pipeline.domain import DomainGrouper
+from n2dm.pipeline.export import BPMNExporter
+from n2dm.pipeline.flow import FlowMapper
+from n2dm.pipeline.glossary import GlossaryBuilder
+from n2dm.pipeline.risk import RiskAnnotator
+from n2dm.pipeline.validate import ConnectivityValidator
 
-try:
-    import graphviz  # type: ignore
-except ImportError:  # pragma: no cover
-    graphviz = None
+# --------------------------------------------------------------------------- #
+# Логирование
+# --------------------------------------------------------------------------- #
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("gui")
 
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------#
-# Асинхронный исполнитель конвейера                                          #
-# ---------------------------------------------------------------------------#
+# --------------------------------------------------------------------------- #
+# Qt-совместимый раннер конвейера (работает в отдельном QThread)
+# --------------------------------------------------------------------------- #
 class PipelineRunner(QObject):
-    """Qt‑friendly wrapper для выполнения Pipeline в отдельном потоке."""
-
     progress = Signal(int, str)  # процент, сообщение
-    finished = Signal(dict)      # итоговый data‑словарь
+    finished = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, steps: list | None = None) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self._steps = steps or ALL_STEPS
-        self._data: Dict[str, Any] = {}
+        self.steps = [
+            GlossaryBuilder(),
+            ActionExtractor(),
+            DomainGrouper(),
+            FlowMapper(),
+            RiskAnnotator(),
+            ConnectivityValidator(),
+            BPMNExporter(),
+        ]
+        self.data: Dict[str, Any] = {}
 
     @Slot(str)
     def run(self, input_path: str) -> None:
-        """Точка входа для QThread — оборачивает asyncio‑цикл."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._execute(input_path))
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Pipeline failed")
+            loop.run_until_complete(self._exec(input_path))
+        except Exception as exc:
+            log.exception("Pipeline failed")
             self.failed.emit(str(exc))
         finally:
             loop.close()
 
-    async def _execute(self, input_path: str) -> None:
-        self._data["input_path"] = input_path
-        total = len(self._steps)
-
-        for idx, step in enumerate(self._steps, start=1):
+    async def _exec(self, input_path: str) -> None:
+        self.data["input_path"] = input_path
+        total = len(self.steps)
+        for idx, step in enumerate(self.steps, start=1):
             self.progress.emit(int((idx - 1) / total * 100), f"{step.name}…")
-            result = await step.run(self._data)
-            self._data[step.name] = result["payload"]
-            logger.info("%s done", step.name)
+            res = await step.run(self.data)
+            self.data[step.name] = res["payload"]
             self.progress.emit(int(idx / total * 100), f"{step.name} ✓")
+        self.finished.emit(self.data)
 
-        self.finished.emit(self._data)
-
-
-# ---------------------------------------------------------------------------#
-# Диалог настроек                                                            #
-# ---------------------------------------------------------------------------#
-class SettingsDialog(QDialog):
-    def __init__(self, cfg: dict, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Настройки")
-        self._cfg = cfg
-
-        layout = QFormLayout(self)
-        self._api_edit = QLineEdit(cfg["openai"]["api_key"])
-        self._api_edit.setEchoMode(QLineEdit.Password)
-        layout.addRow("OpenAI API‑Key:", self._api_edit)
-
-        save_label = QLabel('<a href="#">Сохранить</a>')
-        save_label.setOpenExternalLinks(False)
-        save_label.linkActivated.connect(lambda _: self.accept())
-        layout.addRow(save_label)
-
-    def accept(self) -> None:  # noqa: D401
-        self._cfg["openai"]["api_key"] = self._api_edit.text().strip()
-        save_config(self._cfg)
-        super().accept()
-
-
-# ---------------------------------------------------------------------------#
-# Главное окно                                                               #
-# ---------------------------------------------------------------------------#
+# --------------------------------------------------------------------------- #
+# Главное окно
+# --------------------------------------------------------------------------- #
 class MainWindow(QMainWindow):
-    """Главное окно Narrative2DomainModel GUI."""
-
-    def __init__(self, cfg: dict) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Narrative2DomainModel")
         self.resize(1000, 700)
-        self.setAcceptDrops(True)
 
-        self.cfg = cfg
-        self._input_path: Optional[str] = None
-        self._thread: Optional[QThread] = None
-        self._runner: Optional[PipelineRunner] = None
-
-        # Tabs
+        # вкладки
         self.tabs = QTabWidget(self)
         self.setCentralWidget(self.tabs)
-
         self.preview_tab = QTextEdit(readOnly=True)
         self.progress_tab = QTextEdit(readOnly=True)
         self.schema_tab = QTextEdit(readOnly=True)
         self.bpmn_tab = QTextEdit(readOnly=True)
         self.report_tab = QTextEdit(readOnly=True)
+        self.tabs.addTab(self.preview_tab, "Предпросмотр")
+        self.tabs.addTab(self.progress_tab, "Прогресс")
+        self.tabs.addTab(self.schema_tab, "Схема JSON")
+        self.tabs.addTab(self.bpmn_tab, "BPMN-XML")
+        self.tabs.addTab(self.report_tab, "Отчёт")
 
-        for widget, title in [
-            (self.preview_tab, "Предпросмотр"),
-            (self.progress_tab, "Прогресс"),
-            (self.schema_tab, "Схема"),
-            (self.bpmn_tab, "BPMN"),
-            (self.report_tab, "Отчёт"),
-        ]:
-            self.tabs.addTab(widget, title)
-
-        # Toolbar
-        tb = QToolBar("Main", self)
+        # тулбар
+        tb = QToolBar("Main")
         self.addToolBar(tb)
-
         open_act = QAction("Открыть…", self)
         open_act.triggered.connect(self.open_file)  # type: ignore[arg-type]
         tb.addAction(open_act)
+        run_act = QAction("Сгенерировать", self)
+        run_act.triggered.connect(self.generate)  # type: ignore[arg-type]
+        tb.addAction(run_act)
 
-        gen_act = QAction("Сгенерировать модель", self)
-        gen_act.triggered.connect(self.generate_model)  # type: ignore[arg-type]
-        tb.addAction(gen_act)
-
-        # Settings menu
-        settings_act = QAction("Настройки", self)
-        settings_act.triggered.connect(self.open_settings)  # type: ignore[arg-type]
-        self.menuBar().addMenu("Настройки").addAction(settings_act)
-
-        # Status bar + progress
+        # статус-бар + progress
         self.status = QStatusBar(self)
         self.setStatusBar(self.status)
-        self.progress_bar = QProgressBar(self)
-        self.status.addPermanentWidget(self.progress_bar)
+        self.progress = QProgressBar(self)
+        self.status.addPermanentWidget(self.progress)
 
-    # ------------------------ Drag‑and‑Drop ---------------------------------
-    def dragEnterEvent(self, event) -> None:  # noqa: D401
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
+        # pipeline
+        self._thread: Optional[QThread] = None
+        self._runner: Optional[PipelineRunner] = None
+        self._input: Optional[str] = None
 
-    def dropEvent(self, event) -> None:  # noqa: D401
-        urls = event.mimeData().urls()
-        if urls:
-            self.load_file(urls[0].toLocalFile())
-
-    # ------------------------ File handling ---------------------------------
+    # ---------- Файл --------------------------------------------------------
+    @Slot()
     def open_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Выберите файл", os.getcwd(), "Text/Audio (*.txt *.mp3)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл", os.getcwd(), "Text (*.txt);;All (*)"
+        )
         if path:
-            self.load_file(path)
+            self._load(path)
 
-    def load_file(self, path: str) -> None:
-        self._input_path = path
-        p = Path(path)
-        if p.suffix.lower() == ".txt":
-            self.preview_tab.setPlainText(p.read_text(encoding="utf-8"))
-        else:
-            self.preview_tab.setPlainText(f"Аудиофайл: {p.name}\n(расшифровка ещё не реализована)")
-
+    def _load(self, path: str) -> None:
+        self._input = path
+        text = Path(path).read_text("utf-8")
+        self.preview_tab.setPlainText(text)
+        self.status.showMessage(f"Загружен {Path(path).name}")
         self.tabs.setCurrentWidget(self.preview_tab)
-        self.status.showMessage(f"Загружен файл: {p.name}")
 
-    # ------------------------ Settings dialog ------------------------------
-    def open_settings(self) -> None:
-        SettingsDialog(self.cfg, self).exec()
-
-    # ------------------------ Pipeline run ---------------------------------
-    def generate_model(self) -> None:
-        if not self._input_path:
-            QMessageBox.warning(self, "Нет файла", "Сначала загрузите входной файл.")
+    # ---------- Генерация ---------------------------------------------------
+    @Slot()
+    def generate(self) -> None:
+        if not self._input:
+            QMessageBox.warning(self, "Нет файла", "Загрузите входной файл.")
             return
-
-        # Очистка вкладок результатов
-        self.schema_tab.clear()
-        self.bpmn_tab.clear()
-        self.report_tab.clear()
         self.progress_tab.clear()
-        self.progress_bar.reset()
+        self.progress.setValue(0)
 
-        # Создаём поток и раннер
-        self._thread = QThread(self)
+        self._thread = QThread()
         self._runner = PipelineRunner()
         self._runner.moveToThread(self._thread)
-
-        self._thread.started.connect(lambda: self._runner.run(self._input_path))  # type: ignore[arg-type]
-        self._runner.progress.connect(self.on_progress)
-        self._runner.finished.connect(self.on_finished)
-        self._runner.failed.connect(self.on_failed)
+        self._thread.started.connect(lambda: self._runner.run(self._input))  # type: ignore[arg-type]
+        self._runner.progress.connect(self._on_progress)
+        self._runner.finished.connect(self._on_finish)
+        self._runner.failed.connect(self._on_fail)
         self._runner.finished.connect(self._thread.quit)
         self._runner.failed.connect(self._thread.quit)
-
         self._thread.start()
-        self.status.showMessage("Генерация модели…")
+        self.status.showMessage("Генерация…")
 
-    # ------------------------ Slots ----------------------------------------
     @Slot(int, str)
-    def on_progress(self, percent: int, msg: str) -> None:
-        self.progress_bar.setValue(percent)
-        self.progress_tab.append(f"{percent}% — {msg}")
+    def _on_progress(self, pct: int, msg: str) -> None:
+        self.progress.setValue(pct)
+        self.progress_tab.append(f"{pct}% — {msg}")
 
     @Slot(dict)
-    def on_finished(self, data: dict) -> None:
-        self.progress_bar.setValue(100)
-        self.progress_tab.append("\n✅ Модель сгенерирована успешно.")
+    def _on_finish(self, data: dict) -> None:
+        self.progress.setValue(100)
         self.status.showMessage("Готово")
-
-        out_dir = Path.cwd()
-        self.schema_tab.setPlainText((out_dir / "domain_model.json").read_text("utf-8"))
-        self.bpmn_tab.setPlainText((out_dir / "process.bpmn").read_text("utf-8"))
-        self.report_tab.setPlainText((out_dir / "report.md").read_text("utf-8"))
-        if (out_dir / "diagram.svg").exists():
-            self.schema_tab.append("\n[SVG диаграмма сохранена во внешнем файле]")
-
+        out = Path.cwd()
+        self.schema_tab.setPlainText((out / "domain_model.json").read_text("utf-8"))
+        self.bpmn_tab.setPlainText((out / "process.bpmn").read_text("utf-8"))
+        self.report_tab.setPlainText((out / "report.md").read_text("utf-8"))
+        self.progress_tab.append("\n✅ Завершено успешно")
         self.tabs.setCurrentWidget(self.report_tab)
 
     @Slot(str)
-    def on_failed(self, message: str) -> None:
-        QMessageBox.critical(self, "Ошибка", message)
-        self.status.showMessage("Ошибка: " + message)
-        self.progress_bar.reset()
+    def _on_fail(self, msg: str) -> None:
+        QMessageBox.critical(self, "Ошибка", msg)
+        self.status.showMessage("Ошибка")
+        self.progress.reset()
 
+    # ---------- Закрытие ----------------------------------------------------
+    def closeEvent(self, evt: QCloseEvent) -> None:  # noqa: N802
+        if self._thread and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait()
+        super().closeEvent(evt)
 
-# ---------------------------------------------------------------------------#
-# Запуск напрямую (debug)                                                    #
-# ---------------------------------------------------------------------------#
-if __name__ == "__main__":  # pragma: no cover
-    init_logging()
-    app = QApplication(sys
+# --------------------------------------------------------------------------- #
+# Entry-point
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":   # pragma: no cover
+    main()

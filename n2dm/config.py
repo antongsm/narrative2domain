@@ -1,118 +1,87 @@
 #!/usr/bin/env python3
-"""n2dm.config — загрузка и сохранение пользовательских настроек
+"""n2dm.config — загрузка/сохранение настроек
 
-• Читает ~/.n2dm/config.toml (TOML‑формат)
-• Гарантирует наличие всех ключей из DEFAULTS
-• Поддерживает переопределение API‑ключа переменной окружения OPENAI_API_KEY
-• Кроссплатформенная установка прав (0700 только на POSIX)
+Правки после unit‑tests:
+• CONFIG_DIR больше не кешируется при импорте, чтобы monkeypatch HOME
+  внутри тестов корректно менял путь.
+• Функции `config_dir()` и `config_file()` вычисляют путь динамически.
+• save_config(): на POSIX гарантирует chmod 700 для каталога.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict
 
-import tomllib  # stdlib (Python 3.11+)
-
 # ---------------------------------------------------------------------------
-# Константы и значения по умолчанию                                          
+# Константы по умолчанию
 # ---------------------------------------------------------------------------
-CONFIG_DIR: Path = Path.home() / ".n2dm"
-CONFIG_FILE: Path = CONFIG_DIR / "config.toml"
 
 DEFAULTS: Dict[str, Any] = {
     "openai": {
-        "api_key": "",  # переопределяется ENV OPENAI_API_KEY
+        "api_key": "",
         "model": "gpt-4o-mini",
         "timeout": 60,
-        "max_tokens": 48_000,
+        "max_tokens": 48000,
     }
 }
 
+# ---------------------------------------------------------------------------
+# Вспомогательные функции путей (динамические)
+# ---------------------------------------------------------------------------
+
+def config_dir() -> Path:
+    """Возвращает путь к каталогу ~/.n2dm, вычисляя его каждый вызов."""
+    return Path.home() / ".n2dm"
+
+def config_file() -> Path:
+    return config_dir() / "config.toml"
 
 # ---------------------------------------------------------------------------
-# TOML сериализация (пишем файл)                                             
+# TOML helpers
 # ---------------------------------------------------------------------------
 try:
-    # tomli_w является "братом" tomllib для записи TOML
     import tomli_w  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    tomli_w = None  # noqa: N816
 
-    def _dumps_toml(obj: dict) -> str:  # noqa: D401
-        return tomli_w.dumps(obj)
+import tomllib  # stdlib (read‑only)
 
-except ModuleNotFoundError:  # минимальная реализация без внешних зависимостей
-
-    def _fmt(val: Any) -> str:  # noqa: D401
-        if isinstance(val, str):
-            escaped = val.replace("\\", "\\\\").replace("\"", "\\\"")
-            return f'"{escaped}"'
-        return str(val).lower() if isinstance(val, bool) else str(val)
-
-    def _dumps_toml(obj: dict) -> str:  # noqa: D401
-        lines: list[str] = []
-        for section, params in obj.items():
-            lines.append(f"[{section}]")
-            for key, val in params.items():
-                lines.append(f"{key} = {_fmt(val)}")
-            lines.append("")
-        return "\n".join(lines)
-
+def _toml_dump(data: dict) -> str:
+    if tomli_w:
+        return tomli_w.dumps(data)
+    # fallback‑минималист
+    return json.dumps(data, ensure_ascii=False, indent=2)
 
 # ---------------------------------------------------------------------------
-# Основные функции                                                           
+# API
 # ---------------------------------------------------------------------------
 
-def load_config() -> dict:  # noqa: D401
-    """Читает конфиг с диска, сливает с DEFAULTS и применяет ENV‑переопределения."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    # На POSIX‑системах делаем директорию приватной
-    if os.name == "posix":
-        try:
-            os.chmod(CONFIG_DIR, 0o700)
-        except PermissionError:  # может случиться, если нет прав
-            pass
-
-    cfg: Dict[str, Any]
-    if CONFIG_FILE.exists():
-        with CONFIG_FILE.open("rb") as f:
-            cfg = tomllib.load(f)
-    else:
-        cfg = {}
-
-    # Слияние с DEFAULTS (copy → update)
-    merged: Dict[str, Any] = {}
+def load_config() -> dict:
+    """Читает конфиг, дополняет DEFAULTS."""
+    cfg: Dict[str, Any] = {}
+    cfile = config_file()
+    if cfile.exists():
+        cfg = tomllib.loads(cfile.read_text("utf-8"))
+    # merge
+    out: Dict[str, Any] = {}
     for section, defaults in DEFAULTS.items():
-        section_data = defaults.copy()
-        section_data.update(cfg.get(section, {}))
-        merged[section] = section_data
+        out[section] = defaults.copy()
+        out[section].update(cfg.get(section, {}))
+    # override из переменной окружения
+    env_key = os.getenv("OPENAI_API_KEY")
+    if env_key:
+        out.setdefault("openai", {})["api_key"] = env_key
+    return out
 
-    # ENV override: OPENAI_API_KEY
-    if (env_key := os.getenv("OPENAI_API_KEY")):
-        merged.setdefault("openai", {})["api_key"] = env_key
-
-    return merged
-
-
-def save_config(cfg: dict) -> None:  # noqa: D401
-    """Сохраняет конфиг в TOML‑файл (надёжно экранируя строки)."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+def save_config(cfg: dict) -> None:
+    """Сохраняет словарь cfg в ~/.n2dm/config.toml"""
+    cdir = config_dir()
+    cdir.mkdir(parents=True, exist_ok=True)
     if os.name == "posix":
-        try:
-            os.chmod(CONFIG_DIR, 0o700)
-        except PermissionError:
-            pass
-
-    toml_text = _dumps_toml(cfg)
-    with CONFIG_FILE.open("w", encoding="utf-8") as f:
-        f.write(toml_text)
-
-
-# ---------------------------------------------------------------------------
-# CLI helper (debug)                                                         
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":  # pragma: no cover
-    import pprint
-
-    pprint.pp(load_config())
+        os.chmod(cdir, 0o700)
+    cfile = config_file()
+    cfile.write_text(_toml_dump(cfg), encoding="utf-8")

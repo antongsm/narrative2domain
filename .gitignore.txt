@@ -32,7 +32,3 @@ dist/
 # User config
 .n2dm/
 config.toml
-__pycache__/
-dist/
-.env
-.n2dm/

@@ -1,82 +1,76 @@
 #!/usr/bin/env python3
-"""n2dm.pipeline.domain — DomainGrouper (OpenAI + JSON)
+"""
+n2dm.pipeline.domain — DomainGrouper (OpenAI JSON-mode)
 
-Группирует действия по логическим доменам (модулям/слоям).
-
-• Если доступен пакет `openai` и задан API‑ключ — вызывает GPT (response_format="json").
-• При отсутствии — работает в offline‑stub режиме, распределяя действия по двум доменам "UI" и "Backend".
+Группирует действия по логическим доменам.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from n2dm.config import load_config
 from n2dm.pipeline.base import BaseStep, StepResult
 
 logger = logging.getLogger(__name__)
 
-# Try to import OpenAI client -------------------------------------------------
 try:
-    from openai import OpenAI  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover
+    from openai import OpenAI
+except ModuleNotFoundError:
     OpenAI = None  # type: ignore
-    logger.warning("openai package not installed — DomainGrouper runs in stub mode")
 
 
 class DomainGrouper(BaseStep):
     name = "DomainGrouper"
 
-    def __init__(self) -> None:  # noqa: D401
-        cfg = load_config().get("openai", {})
-        self.api_key: str = cfg.get("api_key", "")
-        self.model: str = cfg.get("model", "gpt-4o-mini")
-        self.timeout: int = cfg.get("timeout", 60)
-        self._client = None
-        if OpenAI and self.api_key:
-            try:
-                self._client = OpenAI(api_key=self.api_key)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("OpenAI client init failed → stub mode (%s)", exc)
-                self._client = None
+    def __init__(self) -> None:
+        cfg = load_config()["openai"]
+        self._api_key = cfg.get("api_key", "")
+        self._model = cfg.get("model", "gpt-4o-mini")
+        self._timeout = cfg.get("timeout", 60)
+
+        if OpenAI and self._api_key:
+            self._client = OpenAI(api_key=self._api_key)
+            self._online = True
         else:
-            self._client = None  # stub
+            self._client = None
+            self._online = False
+            logger.warning("%s stub-режим (нет OpenAI / API-key)", self.name)
 
-    # ---------------------------------------------------------------------
-    async def run(self, data: Dict[str, Any]) -> StepResult:  # noqa: D401
-        actions: List[Dict[str, str]] = data.get("actions", [])
+    async def run(self, data: Dict[str, Any]) -> StepResult:
+        actions = data.get("actions", [])
         if not actions:
-            raise ValueError("DomainGrouper требует предварительного шага ActionExtractor")
+            raise ValueError("DomainGrouper требует actions")
 
-        if not self._client:  # --------- Stub branch -------------------
-            ui, backend = [], []
-            for act in actions:
-                (ui if act["actor"].lower().startswith("польз") else backend).append(act)
-            domains = {"UI": ui, "Backend": backend}
-            logger.info("DomainGrouper stub produced %d domains", len(domains))
-        else:  # --------- OpenAI branch --------------------------------
-            prompt = (
-                "Разбей следующий JSON‑список действий по логическим доменам (UI, Backend, DB, и т.д.) "
-                "и верни объект JSON {\"DomainName\": [ ...actions... ], ...}.\n\n"
-                f"Список действий:\n{json.dumps(actions, ensure_ascii=False, indent=2)}"
-            )
+        if self._online:
             try:
+                prompt = (
+                    "Распредели действия по доменам. Верни JSON-объект: ключ — домен, "
+                    "значение — список action-объектов.\n"
+                    f"Actions:\n{json.dumps(actions, ensure_ascii=False)}"
+                )
                 resp = self._client.chat.completions.create(
-                    model=self.model,
-                    response_format="json",
-                    timeout=self.timeout,
+                    model=self._model,
+                    timeout=self._timeout,
+                    response_format={"type": "json_object"},
                     messages=[
-                        {"role": "system", "content": "Ты архитектор ПО и группируешь действия по доменам"},
+                        {"role": "system", "content": "Ты технический архитектор."},
                         {"role": "user", "content": prompt},
                     ],
                 )
-                domains_raw = resp.choices[0].message.content  # type: ignore[index]
-                domains = json.loads(domains_raw) if isinstance(domains_raw, str) else domains_raw  # type: ignore[arg-type]
-            except Exception as exc:  # noqa: BLE001
-                logger.error("OpenAI call failed (%s) → fallback stub", exc)
-                domains = {"All": actions}
+                domains = json.loads(resp.choices[0].message.content)
+            except Exception as exc:
+                logger.error("OpenAI error (%s), fallback", exc.__class__.__name__)
+                domains = self._stub(actions)
+        else:
+            domains = self._stub(actions)
 
         data["domains"] = domains
         return {"name": self.name, "payload": {"domains": domains}}
+
+    @staticmethod
+    def _stub(actions: list[dict]) -> Dict[str, list]:
+        split = max(1, len(actions) // 2)
+        return {"UI": actions[:split], "Backend": actions[split:]}

@@ -1,0 +1,23 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<definitions xmlns='http://www.omg.org/spec/BPMN/20100524/MODEL' xmlns:bpmndi='http://www.omg.org/spec/BPMN/20100524/DI' xmlns:di='http://www.omg.org/spec/DD/20100524/DI' xmlns:dc='http://www.omg.org/spec/DD/20100524/DC' id='Defs_1' targetNamespace='http://n2dm'>
+  <process id='Process_1' isExecutable='false'>
+    <task id='Task_6e71' name='Импорт заказов'/>
+    <task id='Task_26e4' name='Валидация данных'/>
+    <task id='Task_8d41' name='Обработка данных'/>
+    <task id='Task_c8d3' name='Уведомление пользователя'/>
+    <sequenceFlow id='Flow_1' sourceRef='Task_6e71' targetRef='Task_26e4'/>
+    <sequenceFlow id='Flow_2' sourceRef='Task_26e4' targetRef='Task_8d41'/>
+    <sequenceFlow id='Flow_3' sourceRef='Task_8d41' targetRef='Task_c8d3'/>
+  </process>
+  <bpmndi:BPMNDiagram id='Diag_1'>
+    <bpmndi:BPMNPlane id='Plane_1' bpmnElement='Process_1'>
+      <bpmndi:BPMNShape id='Task_6e71_di' bpmnElement='Task_6e71'><dc:Bounds x='100' y='100' width='100' height='80'/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id='Task_26e4_di' bpmnElement='Task_26e4'><dc:Bounds x='100' y='220' width='100' height='80'/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id='Task_8d41_di' bpmnElement='Task_8d41'><dc:Bounds x='100' y='340' width='100' height='80'/></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id='Task_c8d3_di' bpmnElement='Task_c8d3'><dc:Bounds x='100' y='460' width='100' height='80'/></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id='Flow_1_di' bpmnElement='Flow_1'><di:waypoint x='200' y='140'/><di:waypoint x='200' y='260'/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id='Flow_2_di' bpmnElement='Flow_2'><di:waypoint x='200' y='260'/><di:waypoint x='200' y='380'/></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id='Flow_3_di' bpmnElement='Flow_3'><di:waypoint x='200' y='380'/><di:waypoint x='200' y='500'/></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>
