@@ -38,3 +38,8 @@ dist/
 .n2dm/
 .DS_Store
 *.svg # если не хотите версионить авто-генерируемые диаграммы
+.DS_Store
+*.svg
+*.bpmn
+*.json
+*.txt
